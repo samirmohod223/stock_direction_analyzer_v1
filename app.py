@@ -3,214 +3,302 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from datetime import date
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Stock Direction Analyzer", page_icon="📈", layout="wide")
 
-st.title("📈 Indian Stock Direction Analyzer")
-st.caption("Prototype v1 • Technical evidence, not a guaranteed prediction or investment advice")
+st.title("📈 Indian Stock Direction Analyzer — Free Prototype")
+st.caption("Yahoo Finance data • Technical scenarios, not guaranteed predictions or investment advice")
 
+# ---------- Sidebar ----------
 with st.sidebar:
-    st.header("Analysis settings")
-    symbol_input = st.text_input("NSE symbol", value="RELIANCE", help="Enter a symbol without .NS, e.g. TCS, INFY, SBIN, RELIANCE")
-    period = st.selectbox("History to analyse", ["6mo", "1y", "2y", "5y"], index=1)
-    interval = st.selectbox("Chart timeframe", ["1d", "1wk"], index=0, format_func=lambda x: {"1d":"Daily candles","1wk":"Weekly candles"}[x])
-    st.caption("Yahoo Finance symbols for NSE usually use the .NS suffix. BSE symbols and some tickers may need separate handling.")
-    run = st.button("Analyse stock", type="primary", use_container_width=True)
-
-def fetch_data(symbol: str, period: str, interval: str) -> pd.DataFrame:
-    ticker = symbol.strip().upper()
-    if not ticker:
-        raise ValueError("Enter a stock symbol.")
-    yf_symbol = ticker if "." in ticker else f"{ticker}.NS"
-    data = yf.download(
-        yf_symbol, period=period, interval=interval,
-        auto_adjust=True, progress=False, threads=False
+    st.header("Monitor settings")
+    symbol_input = st.text_input(
+        "NSE stock symbol", value="RELIANCE",
+        help="Examples: RELIANCE, TCS, INFY, SBIN. NSE suffix .NS is added automatically."
     )
-    if data is None or data.empty:
-        raise ValueError(f"No data returned for {yf_symbol}. Check the symbol or try another NSE symbol.")
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    required = {"Open", "High", "Low", "Close", "Volume"}
-    if not required.issubset(set(data.columns)):
-        raise ValueError(f"Market data is missing required fields. Returned columns: {list(data.columns)}")
-    data = data.loc[:, ["Open", "High", "Low", "Close", "Volume"]].copy()
-    for col in data.columns:
-        data[col] = pd.to_numeric(data[col], errors="coerce")
-    data = data.dropna(subset=["Open", "High", "Low", "Close"])
-    data = data[~data.index.duplicated(keep="last")].sort_index()
-    if len(data) < 60:
-        raise ValueError("Not enough history to calculate the indicators reliably.")
-    return data
+    timeframe = st.selectbox(
+        "Timeframe",
+        ["5-minute", "15-minute", "Daily"],
+        index=0,
+        help="Free Yahoo intraday history and availability can be limited."
+    )
+    refresh = st.selectbox("Auto-refresh", ["Off", "60 seconds", "5 minutes"], index=0)
+    history = st.selectbox("Daily history", ["6 months", "1 year", "2 years", "5 years"], index=1)
+    run = st.button("Fetch / refresh analysis", type="primary", use_container_width=True)
+    st.caption("This is a free prototype. Yahoo data may be delayed, incomplete, throttled, or unavailable.")
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    x = df.copy()
-    c, h, l, o, v = x["Close"], x["High"], x["Low"], x["Open"], x["Volume"]
-    x["SMA20"] = c.rolling(20).mean()
-    x["SMA50"] = c.rolling(50).mean()
-    x["EMA12"] = c.ewm(span=12, adjust=False).mean()
-    x["EMA26"] = c.ewm(span=26, adjust=False).mean()
-    x["MACD"] = x["EMA12"] - x["EMA26"]
-    x["MACD_signal"] = x["MACD"].ewm(span=9, adjust=False).mean()
-    delta = c.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
+PERIOD_MAP = {"6 months": "6mo", "1 year": "1y", "2 years": "2y", "5 years": "5y"}
+INTERVAL_MAP = {"5-minute": "5m", "15-minute": "15m", "Daily": "1d"}
+IST = ZoneInfo("Asia/Kolkata")
+
+def normalise_symbol(raw):
+    s = raw.strip().upper()
+    if not s:
+        raise ValueError("Enter an NSE stock symbol.")
+    if "." not in s and "^" not in s:
+        s += ".NS"
+    return s
+
+def fetch_data(symbol, tf, daily_history):
+    interval = INTERVAL_MAP[tf]
+    if interval == "1d":
+        period = PERIOD_MAP[daily_history]
+    elif interval == "5m":
+        # Yahoo Finance typically limits 5-minute history to recent days.
+        period = "5d"
+    else:
+        # Yahoo Finance typically limits 15-minute history to recent weeks.
+        period = "60d"
+    df = yf.download(
+        symbol, period=period, interval=interval, auto_adjust=True,
+        progress=False, threads=False, prepost=False
+    )
+    if df is None or df.empty:
+        raise RuntimeError(
+            "No data returned. Check the ticker, try again later, or switch timeframe. "
+            "Free data providers can throttle or temporarily block requests."
+        )
+    # yfinance may return MultiIndex columns even for one ticker.
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] if isinstance(c, tuple) else c for c in df.columns]
+    needed = ["Open", "High", "Low", "Close", "Volume"]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise RuntimeError(f"Provider response is missing columns: {', '.join(missing)}")
+    df = df[needed].copy()
+    for c in needed:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Open", "High", "Low", "Close"])
+    df = df[~df.index.duplicated(keep="last")].sort_index()
+    if len(df) < 30:
+        raise RuntimeError(f"Only {len(df)} candles received; at least 30 are needed for this analysis.")
+    return df
+
+def add_indicators(df):
+    d = df.copy()
+    close = d["Close"]
+    d["SMA20"] = close.rolling(20).mean()
+    d["SMA50"] = close.rolling(50).mean()
+    d["EMA12"] = close.ewm(span=12, adjust=False).mean()
+    d["EMA26"] = close.ewm(span=26, adjust=False).mean()
+    d["MACD"] = d["EMA12"] - d["EMA26"]
+    d["MACD_signal"] = d["MACD"].ewm(span=9, adjust=False).mean()
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / loss.replace(0, np.nan)
-    x["RSI"] = 100 - (100 / (1 + rs))
-    x["RSI"] = x["RSI"].fillna(100).where(loss.eq(0), x["RSI"])
-    x["ATR"] = pd.concat([
-        h-l, (h-c.shift()).abs(), (l-c.shift()).abs()
-    ], axis=1).max(axis=1).rolling(14).mean()
-    x["Volume20"] = v.rolling(20).mean()
-    x["VolRatio"] = v / x["Volume20"].replace(0, np.nan)
+    d["RSI"] = 100 - (100 / (1 + rs))
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        d["High"] - d["Low"],
+        (d["High"] - prev_close).abs(),
+        (d["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    d["ATR"] = tr.rolling(14).mean()
+    d["VolumeAvg20"] = d["Volume"].rolling(20).mean()
+    d["VolumeRatio"] = d["Volume"] / d["VolumeAvg20"].replace(0, np.nan)
+    return d
 
-    prev_o, prev_c = o.shift(1), c.shift(1)
-    body = (c-o).abs()
-    prev_body = (prev_c-prev_o).abs()
-    candle_range = (h-l).replace(0, np.nan)
-    lower_shadow = pd.concat([o, c], axis=1).min(axis=1)-l
-    upper_shadow = h-pd.concat([o, c], axis=1).max(axis=1)
-    x["Pattern"] = ""
-    bullish_engulf = (prev_c < prev_o) & (c > o) & (o <= prev_c) & (c >= prev_o)
-    bearish_engulf = (prev_c > prev_o) & (c < o) & (o >= prev_c) & (c <= prev_o)
-    hammer = (lower_shadow >= 2*body) & (upper_shadow <= body*0.6) & (body/candle_range <= 0.4)
-    shooting_star = (upper_shadow >= 2*body) & (lower_shadow <= body*0.6) & (body/candle_range <= 0.4)
-    doji = body/candle_range <= 0.1
-    x.loc[bullish_engulf, "Pattern"] = "Bullish engulfing"
-    x.loc[bearish_engulf, "Pattern"] = "Bearish engulfing"
-    x.loc[hammer, "Pattern"] = "Hammer"
-    x.loc[shooting_star, "Pattern"] = "Shooting star"
-    x.loc[doji, "Pattern"] = "Doji"
-    return x
+def detect_patterns(d):
+    if len(d) < 3:
+        return []
+    a, b = d.iloc[-2], d.iloc[-1]
+    patterns = []
+    body = abs(b["Close"] - b["Open"])
+    candle_range = max(b["High"] - b["Low"], 1e-9)
+    upper = b["High"] - max(b["Open"], b["Close"])
+    lower = min(b["Open"], b["Close"]) - b["Low"]
+    prev_body = abs(a["Close"] - a["Open"])
+    # Engulfing patterns require opposite candle colours and body engulfing.
+    if a["Close"] < a["Open"] and b["Close"] > b["Open"] and b["Open"] <= a["Close"] and b["Close"] >= a["Open"]:
+        patterns.append(("Bullish engulfing", "Bullish", "Potential reversal; needs confirmation."))
+    if a["Close"] > a["Open"] and b["Close"] < b["Open"] and b["Open"] >= a["Close"] and b["Close"] <= a["Open"]:
+        patterns.append(("Bearish engulfing", "Bearish", "Potential reversal; needs confirmation."))
+    if lower >= 2 * max(body, candle_range * 0.02) and upper <= candle_range * 0.25:
+        patterns.append(("Hammer-like candle", "Bullish", "Long lower wick; context and next-candle confirmation matter."))
+    if upper >= 2 * max(body, candle_range * 0.02) and lower <= candle_range * 0.25:
+        patterns.append(("Shooting-star-like candle", "Bearish", "Long upper wick; context and next-candle confirmation matter."))
+    if body / candle_range <= 0.10:
+        patterns.append(("Doji / small body", "Neutral", "Indecision candle; not a direction signal by itself."))
+    return patterns
 
-def score_latest(x: pd.DataFrame):
-    row = x.iloc[-1]
+def score_signal(d):
+    last = d.iloc[-1]
     score = 0
     evidence = []
     risks = []
-    # Trend
-    if pd.notna(row["SMA20"]) and pd.notna(row["SMA50"]):
-        if row["Close"] > row["SMA20"] > row["SMA50"]:
-            score += 2; evidence.append("Price is above the 20-day average, which is above the 50-day average.")
-        elif row["Close"] < row["SMA20"] < row["SMA50"]:
-            score -= 2; evidence.append("Price is below the 20-day average, which is below the 50-day average.")
-        elif row["Close"] > row["SMA20"]:
-            score += 1; evidence.append("Price is above its 20-period average.")
-        elif row["Close"] < row["SMA20"]:
-            score -= 1; evidence.append("Price is below its 20-period average.")
-    # MACD
-    if pd.notna(row["MACD"]) and pd.notna(row["MACD_signal"]):
-        if row["MACD"] > row["MACD_signal"]:
-            score += 1; evidence.append("MACD is above its signal line (positive momentum evidence).")
+    if pd.notna(last["SMA20"]):
+        if last["Close"] > last["SMA20"]:
+            score += 1; evidence.append("Close is above the 20-candle average.")
         else:
-            score -= 1; evidence.append("MACD is below its signal line (negative momentum evidence).")
-    # RSI
-    if pd.notna(row["RSI"]):
-        if 50 <= row["RSI"] <= 68:
-            score += 1; evidence.append(f"RSI is {row['RSI']:.1f}, consistent with positive but not extreme momentum.")
-        elif row["RSI"] < 40:
-            score -= 1; evidence.append(f"RSI is {row['RSI']:.1f}, indicating weak momentum; oversold conditions can still fall further.")
-        elif row["RSI"] > 75:
-            risks.append(f"RSI is {row['RSI']:.1f}; the stock may be stretched and vulnerable to a pullback.")
-    # Volume
-    if pd.notna(row["VolRatio"]):
-        if row["VolRatio"] >= 1.5 and row["Close"] > row["Open"]:
-            score += 1; evidence.append(f"Latest candle rose on {row['VolRatio']:.1f}× its 20-period average volume.")
-        elif row["VolRatio"] >= 1.5 and row["Close"] < row["Open"]:
-            score -= 1; evidence.append(f"Latest candle fell on {row['VolRatio']:.1f}× its 20-period average volume.")
-    # Latest candle pattern is weak evidence only
-    pattern = row["Pattern"] if isinstance(row["Pattern"], str) else ""
-    if pattern == "Bullish engulfing":
-        score += 1; evidence.append("Latest candle meets a bullish-engulfing rule; confirmation is still needed.")
-    elif pattern == "Bearish engulfing":
-        score -= 1; evidence.append("Latest candle meets a bearish-engulfing rule; confirmation is still needed.")
-    elif pattern in ("Hammer", "Shooting star", "Doji"):
-        risks.append(f"Latest candle was classified as {pattern}; context and following candles matter.")
-    if pd.notna(row["ATR"]) and row["Close"] > 0:
-        atr_pct = row["ATR"] / row["Close"] * 100
-        if atr_pct >= 4:
-            risks.append(f"ATR is {atr_pct:.1f}% of price, suggesting elevated recent volatility.")
+            score -= 1; evidence.append("Close is below the 20-candle average.")
+    if pd.notna(last["SMA50"]):
+        if last["Close"] > last["SMA50"]:
+            score += 1; evidence.append("Close is above the 50-candle average.")
+        else:
+            score -= 1; evidence.append("Close is below the 50-candle average.")
+    if pd.notna(last["MACD"]) and pd.notna(last["MACD_signal"]):
+        if last["MACD"] > last["MACD_signal"]:
+            score += 1; evidence.append("MACD is above its signal line.")
+        else:
+            score -= 1; evidence.append("MACD is below its signal line.")
+    if pd.notna(last["RSI"]):
+        if 55 <= last["RSI"] < 70:
+            score += 1; evidence.append(f"RSI {last['RSI']:.1f} shows positive momentum without being extremely overbought.")
+        elif last["RSI"] < 45:
+            score -= 1; evidence.append(f"RSI {last['RSI']:.1f} indicates weak momentum.")
+        elif last["RSI"] >= 70:
+            risks.append(f"RSI is {last['RSI']:.1f}; momentum may be overextended.")
+        else:
+            evidence.append(f"RSI {last['RSI']:.1f} is in a middle/neutral zone.")
+    if pd.notna(last["VolumeRatio"]) and last["VolumeRatio"] >= 1.5:
+        evidence.append(f"Volume is {last['VolumeRatio']:.1f}× its 20-candle average.")
     else:
-        atr_pct = np.nan
+        risks.append("No strong volume expansion confirmed by the current candle.")
+    if score >= 2:
+        label = "Bullish bias"
+    elif score <= -2:
+        label = "Bearish bias"
+    else:
+        label = "Mixed / neutral"
+    return label, score, evidence, risks
 
-    label = "Bullish" if score >= 2 else ("Bearish" if score <= -2 else "Neutral / mixed")
-    return score, label, evidence, risks, atr_pct
+def forecast_scenarios(d, timeframe):
+    # ATR-based scenario bands, not a trained prediction model.
+    last = d.iloc[-1]
+    price = float(last["Close"])
+    atr = float(last["ATR"]) if pd.notna(last["ATR"]) else np.nan
+    if not np.isfinite(atr) or atr <= 0:
+        returns = d["Close"].pct_change().dropna()
+        atr = price * float(returns.tail(20).std()) if len(returns) >= 5 else price * 0.01
+    if timeframe == "5-minute":
+        horizons = [("Next 15 minutes", 3), ("Next 1 hour", 12)]
+    elif timeframe == "15-minute":
+        horizons = [("Next 1 hour", 4), ("Next 1 trading day", 26)]
+    else:
+        horizons = [("Next 1 trading day", 1), ("Next 5 trading days", 5)]
+    rows = []
+    for name, n in horizons:
+        # Square-root-of-time scaling is a rough volatility assumption, not a directional forecast.
+        move = atr * np.sqrt(n)
+        rows.append({
+            "Horizon": name,
+            "Lower scenario": max(0, price - move),
+            "Reference price": price,
+            "Upper scenario": price + move,
+            "Range width (%)": 200 * move / price if price else np.nan
+        })
+    return pd.DataFrame(rows), atr
 
-if "analysis_df" not in st.session_state:
-    st.session_state.analysis_df = None
-    st.session_state.analysis_symbol = None
+def format_price(v):
+    return f"₹{v:,.2f}"
 
-if run:
+# Refresh is user-controlled; Streamlit Community Cloud may sleep while inactive.
+if refresh != "Off":
     try:
-        with st.spinner("Fetching market data and calculating indicators..."):
-            raw = fetch_data(symbol_input, period, interval)
-            analysed = add_indicators(raw)
-            st.session_state.analysis_df = analysed
-            st.session_state.analysis_symbol = symbol_input.strip().upper()
-    except Exception as e:
-        st.error(str(e))
+        from streamlit_autorefresh import st_autorefresh
+        interval_ms = 60_000 if refresh == "60 seconds" else 300_000
+        st_autorefresh(interval=interval_ms, key="market_refresh")
+    except Exception:
+        st.info("Auto-refresh component isn't available yet. Use the Fetch / refresh button.")
 
-df = st.session_state.analysis_df
-symbol = st.session_state.analysis_symbol
-
-if df is None:
-    st.info("Enter an NSE symbol in the sidebar and select **Analyse stock** to begin.")
-    st.markdown("**Try:** RELIANCE, TCS, INFY, SBIN, ITC, LT, HDFCBANK")
+symbol = ""
+try:
+    symbol = normalise_symbol(symbol_input)
+    with st.spinner(f"Fetching {symbol} data…"):
+        raw = fetch_data(symbol, timeframe, history)
+    d = add_indicators(raw)
+    last = d.iloc[-1]
+    label, score, evidence, risks = score_signal(d)
+    patterns = detect_patterns(d)
+    scenarios, atr = forecast_scenarios(d, timeframe)
+except Exception as e:
+    st.error(str(e))
+    st.info("Try a common NSE symbol such as RELIANCE, TCS, INFY or SBIN. If this keeps failing, the free provider may be unavailable or rate-limited.")
     st.stop()
 
-score, label, evidence, risks, atr_pct = score_latest(df)
-latest = df.iloc[-1]
-prev_close = df["Close"].iloc[-2]
-change = (latest["Close"] / prev_close - 1) * 100
-horizon_name = "daily" if interval == "1d" else "weekly"
+# Data freshness warning
+last_stamp = d.index[-1]
+try:
+    if last_stamp.tzinfo is None:
+        last_stamp = last_stamp.tz_localize("UTC")
+    last_ist = last_stamp.tz_convert(IST)
+    now_ist = datetime.now(IST)
+    age_minutes = max(0, (now_ist - last_ist.to_pydatetime()).total_seconds() / 60)
+    stamp_text = last_ist.strftime("%d %b %Y, %I:%M:%S %p IST")
+except Exception:
+    age_minutes = None
+    stamp_text = str(d.index[-1])
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Latest adjusted close", f"₹{latest['Close']:,.2f}", f"{change:+.2f}% vs previous {horizon_name} close")
-c2.metric("Directional bias", label, f"Rule score: {score:+d}")
-c3.metric("RSI (14)", f"{latest['RSI']:.1f}" if pd.notna(latest["RSI"]) else "—")
-c4.metric("ATR (14)", f"₹{latest['ATR']:.2f}" if pd.notna(latest["ATR"]) else "—",
-          f"{atr_pct:.2f}% of price" if pd.notna(atr_pct) else None)
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Latest candle close", format_price(float(last["Close"])))
+m2.metric("Technical bias", label, f"Score {score:+d} / 4")
+m3.metric("RSI (14)", f"{last['RSI']:.1f}" if pd.notna(last["RSI"]) else "—")
+m4.metric("ATR (14)", format_price(atr))
 
-st.caption(f"Symbol: {symbol if '.' in symbol else symbol + '.NS'} • Last data candle: {df.index[-1].strftime('%Y-%m-%d')} • Data source: Yahoo Finance via yfinance. Data may be delayed, incomplete, or unavailable.")
+st.caption(f"Symbol: `{symbol}` · Timeframe: {timeframe} · Latest candle timestamp: {stamp_text}")
+if timeframe != "Daily":
+    st.warning("Intraday data from this free source is not guaranteed real-time. Check the candle timestamp before acting.")
+elif age_minutes is not None and age_minutes > 60 * 24 * 3:
+    st.warning("Latest daily candle looks older than expected. The data may be stale or the market may be closed.")
 
-tab1, tab2, tab3 = st.tabs(["Chart & signals", "Evidence & risks", "Recent data"])
-with tab1:
-    fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Candles"))
-    fig.add_trace(go.Scatter(x=df.index, y=df["SMA20"], name="SMA 20", line=dict(width=1.4)))
-    fig.add_trace(go.Scatter(x=df.index, y=df["SMA50"], name="SMA 50", line=dict(width=1.4)))
-    fig.update_layout(height=620, xaxis_rangeslider_visible=False, margin=dict(l=10,r=10,t=20,b=10), legend=dict(orientation="h"))
-    st.plotly_chart(fig, use_container_width=True)
-    fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI 14"))
-    fig2.add_hline(y=70, line_dash="dash")
-    fig2.add_hline(y=30, line_dash="dash")
-    fig2.update_layout(height=230, yaxis_range=[0,100], margin=dict(l=10,r=10,t=20,b=10))
-    st.plotly_chart(fig2, use_container_width=True)
-    if latest["Pattern"]:
-        st.write(f"**Latest candle pattern detected:** {latest['Pattern']}")
-    else:
-        st.write("**Latest candle pattern detected:** No supported named pattern matched the current rules.")
-with tab2:
-    st.subheader(f"Current technical bias: {label}")
-    st.write("This is a transparent rule-based score, not a trained forecasting model. It does not estimate a validated probability of future returns.")
-    st.markdown("**Evidence**")
-    if evidence:
-        for item in evidence: st.write(f"- {item}")
-    else:
-        st.write("- Not enough indicator evidence to form a directional view.")
-    st.markdown("**Risks / caveats**")
+# Chart
+fig = go.Figure()
+fig.add_trace(go.Candlestick(
+    x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"],
+    name="Candles"
+))
+fig.add_trace(go.Scatter(x=d.index, y=d["SMA20"], name="SMA 20", line=dict(width=1.4)))
+fig.add_trace(go.Scatter(x=d.index, y=d["SMA50"], name="SMA 50", line=dict(width=1.4)))
+fig.update_layout(
+    height=570, xaxis_rangeslider_visible=False, template="plotly_dark",
+    margin=dict(l=10, r=10, t=35, b=10), legend=dict(orientation="h", y=1.02)
+)
+st.plotly_chart(fig, use_container_width=True)
+
+left, right = st.columns([1, 1])
+with left:
+    st.subheader("Evidence behind the bias")
+    for item in evidence:
+        st.write("• " + item)
     if risks:
-        for item in risks: st.warning(item)
-    else:
-        st.write("- No special risk flag triggered by the simple rules; this does not mean risk is low.")
-    st.write("- The signal can reverse quickly and does not include live news, company fundamentals, broad-market context, brokerage, taxes or slippage.")
-    st.write("- Candlestick patterns are descriptive, not inherently predictive. Confirm with price context and test the rules before using real money.")
-with tab3:
-    show_cols = ["Open","High","Low","Close","Volume","SMA20","SMA50","RSI","MACD","MACD_signal","ATR","VolRatio","Pattern"]
-    st.dataframe(df[show_cols].tail(40).sort_index(ascending=False), use_container_width=True)
-    csv = df.to_csv().encode("utf-8")
-    st.download_button("Download analysed data as CSV", data=csv, file_name=f"{symbol.replace('.','_')}_analysis.csv", mime="text/csv")
+        st.subheader("Risks / missing confirmation")
+        for item in risks:
+            st.write("⚠️ " + item)
+    st.caption("The score is a simple rules-based summary, not a calibrated probability of price direction.")
 
-st.divider()
-st.caption("Prototype limitations: Yahoo Finance is a convenient research source, not a guaranteed real-time or official NSE feed. Validate data quality, licensing, and symbol mappings before relying on it. Do not trade solely on this signal.")
+with right:
+    st.subheader("Candlestick patterns in latest candle")
+    if patterns:
+        for name, direction, note in patterns:
+            st.write(f"**{name}** — {direction}")
+            st.caption(note)
+    else:
+        st.write("No listed pattern detected in the latest candle.")
+    st.caption("Patterns are approximate rule-based detections and should be confirmed by context and subsequent candles.")
+
+st.subheader("Possible price range scenarios")
+st.caption("ATR-based volatility bands, not a directional prediction or price target. Actual prices can move outside these ranges.")
+view = scenarios.copy()
+for c in ["Lower scenario", "Reference price", "Upper scenario"]:
+    view[c] = view[c].map(format_price)
+view["Range width (%)"] = view["Range width (%)"].map(lambda x: f"{x:.2f}%" if pd.notna(x) else "—")
+st.dataframe(view, use_container_width=True, hide_index=True)
+
+with st.expander("Download data / inspect recent candles"):
+    export = d.reset_index()
+    st.download_button(
+        "Download analysed candles as CSV",
+        data=export.to_csv(index=False).encode("utf-8"),
+        file_name=f"{symbol.replace('.', '_')}_{INTERVAL_MAP[timeframe]}_analysis.csv",
+        mime="text/csv"
+    )
+    st.dataframe(d.tail(15).sort_index(ascending=False), use_container_width=True)
+
+st.info(
+    "Important limitations: this prototype does not guarantee real-time data, does not use a trained forecasting model, "
+    "does not know future news, and does not place orders. Forecast ranges use recent volatility only. "
+    "Test on paper first and never treat a technical bias as a buy/sell instruction."
+)
